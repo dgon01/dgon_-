@@ -238,26 +238,43 @@ def read_text_from_region(region_box, retry_count=0, max_retries=3):
         check_stop_signal()
         pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD_PATH
 
-        # ===== [수정] 사용자 폴더에 임시 이미지 저장 (WinError 5 완전 해결) =====
-        # 스크립트 실행 폴더에 임시 이미지를 저장하여 권한 문제 회피
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        temp_image_path = os.path.join(script_dir, f"temp_ocr_{time.time()}.png")
+        # ===== [수정] Documents 폴더 사용 (가장 안전) =====
+        # 바이러스 백신/보안 프로그램이 차단할 가능성이 가장 낮은 위치
+        documents_dir = os.path.join(os.path.expanduser("~"), "Documents")
+        if not os.path.exists(documents_dir):
+            # Documents 폴더가 없으면 홈 디렉토리 사용
+            documents_dir = os.path.expanduser("~")
+
+        temp_image_path = os.path.join(documents_dir, f"temp_kakao_ocr_{int(time.time() * 1000)}.png")
 
         # 환경 변수 설정
-        os.environ['TEMP'] = script_dir
-        os.environ['TMP'] = script_dir
+        os.environ['TEMP'] = documents_dir
+        os.environ['TMP'] = documents_dir
         os.environ['TESSDATA_PREFIX'] = os.path.dirname(TESSERACT_CMD_PATH)
-        # ==================================================================
+
+        if retry_count == 0:  # 첫 시도에만 로그
+            log_message(f"[디버그] 임시 파일 위치: {temp_image_path}")
+        # =================================================
 
         screenshot = pyautogui.screenshot(region=region_box)
 
-        # ===== [신규] 이미지를 안전한 위치에 명시적으로 저장 =====
-        screenshot.save(temp_image_path)
-        # =====================================================
+        # ===== [신규] 이미지 저장 시도 + 성공 확인 =====
+        try:
+            screenshot.save(temp_image_path)
+            if not os.path.exists(temp_image_path):
+                raise FileNotFoundError(f"이미지 저장 실패: 파일이 생성되지 않음")
+            if retry_count == 0:
+                log_message(f"[디버그] 이미지 저장 성공: {os.path.getsize(temp_image_path)} bytes")
+        except Exception as save_error:
+            log_message(f"❌ 이미지 저장 실패: {save_error}")
+            raise
+        # ==============================================
 
         if _HAS_CV:
             # ===== [수정] 파일에서 이미지 읽기 =====
             img = cv2.imread(temp_image_path)
+            if img is None:
+                raise FileNotFoundError(f"CV2가 이미지를 읽을 수 없음: {temp_image_path}")
             if img.ndim == 3:
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
@@ -265,10 +282,18 @@ def read_text_from_region(region_box, retry_count=0, max_retries=3):
             # ========================================
 
             cfg = r'--oem 1 --psm 7 -c preserve_interword_spaces=1'
+            if retry_count == 0:
+                log_message(f"[디버그] Tesseract 호출 시작...")
             text = pytesseract.image_to_string(img, lang='kor+eng', config=cfg)
+            if retry_count == 0:
+                log_message(f"[디버그] Tesseract 호출 완료")
         else:
             # ===== [수정] 파일 경로를 직접 전달 =====
+            if retry_count == 0:
+                log_message(f"[디버그] Tesseract 호출 시작 (CV2 없음)...")
             text = pytesseract.image_to_string(temp_image_path, lang='kor+eng')
+            if retry_count == 0:
+                log_message(f"[디버그] Tesseract 호출 완료")
             # ========================================
 
         text = _normalize_name(text)
