@@ -237,10 +237,15 @@ def read_text_from_region(region_box, retry_count=0, max_retries=3):
         check_stop_signal()
         pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD_PATH
 
-        # ===== [수정] 임시 폴더를 명시적으로 지정하여 권한 오류 방지 =====
-        temp_dir = tempfile.gettempdir()
+        # ===== [수정] Windows 임시 폴더를 사용자 폴더로 변경 =====
+        # WinError 5를 피하기 위해 사용자가 쓰기 권한이 있는 폴더 사용
+        user_temp = os.path.join(os.path.expanduser("~"), "AppData", "Local", "Temp")
+        if not os.path.exists(user_temp):
+            os.makedirs(user_temp, exist_ok=True)
+        os.environ['TEMP'] = user_temp
+        os.environ['TMP'] = user_temp
         os.environ['TESSDATA_PREFIX'] = os.path.dirname(TESSERACT_CMD_PATH)
-        # ===========================================================
+        # =========================================================
 
         screenshot = pyautogui.screenshot(region=region_box)
 
@@ -250,7 +255,8 @@ def read_text_from_region(region_box, retry_count=0, max_retries=3):
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
             img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
             img = cv2.medianBlur(img, 3)
-            cfg = r'--oem 1 --psm 7 -c preserve_interword_spaces=1'
+            # ===== [수정] pytesseract config에 임시 폴더 명시 =====
+            cfg = f'--oem 1 --psm 7 -c preserve_interword_spaces=1 -c TMPDIR={user_temp}'
             text = pytesseract.image_to_string(img, lang='kor+eng', config=cfg)
         else:
             text = pytesseract.image_to_string(screenshot, lang='kor+eng')
@@ -258,36 +264,54 @@ def read_text_from_region(region_box, retry_count=0, max_retries=3):
         text = _normalize_name(text)
         if not text:
             log_message("경고: OCR이 텍스트를 인식하지 못했습니다. (빈 문자열)")
+
+        # ===== [신규] 성공 시 로그 (디버깅용) =====
+        if retry_count > 0:
+            log_message(f"✅ OCR 재시도 성공! (시도 {retry_count + 1}회 만에 성공)")
+        # ==========================================
+
         return text
 
-    except PermissionError as e:
-        # ===== [신규] Windows 권한 오류 특별 처리 =====
-        if retry_count < max_retries:
-            log_message(f"⚠️ Windows 권한 오류 발생 ({retry_count + 1}/{max_retries}): {e}")
-            log_message(f"0.5초 후 재시도합니다...")
-            time.sleep(0.5)
+    except (PermissionError, OSError) as e:
+        # ===== [수정] OSError도 명시적으로 캐치 (WinError 5 포함) =====
+        error_str = str(e)
+        is_permission_error = "WinError 5" in error_str or "액세스가 거부" in error_str
+
+        if is_permission_error and retry_count < max_retries:
+            log_message(f"⚠️ Windows 권한 오류 발생 ({retry_count + 1}/{max_retries + 1}): {e}")
+            log_message(f"1초 후 재시도합니다...")
+            time.sleep(1)
             return read_text_from_region(region_box, retry_count + 1, max_retries)
         else:
-            log_message(f"❌ OCR 권한 오류 ({max_retries}회 재시도 실패): {e}")
-            log_message("💡 해결 방법:")
-            log_message("  1. 프로그램을 '관리자 권한'으로 실행하세요")
-            log_message("  2. 바이러스 백신/보안 프로그램이 차단하는지 확인하세요")
-            log_message("  3. Tesseract 설치 폴더 권한을 확인하세요")
+            log_message(f"❌ OCR 권한 오류 ({retry_count + 1}회 시도 후 실패): {e}")
+            if retry_count >= max_retries:
+                log_message("💡 해결 방법:")
+                log_message("  1. 프로그램을 '관리자 권한'으로 실행하세요")
+                log_message("  2. 바이러스 백신/보안 프로그램을 일시 중지하세요")
+                log_message("  3. C:\\Users\\[사용자명]\\AppData\\Local\\Temp 폴더 권한을 확인하세요")
             return ""
-        # ================================================
+        # ================================================================
 
     except Exception as e:
-        # ===== [수정] 일반 오류도 재시도 로직 적용 =====
-        if retry_count < max_retries:
-            log_message(f"⚠️ OCR 오류 발생 ({retry_count + 1}/{max_retries}): {e}")
+        # ===== [수정] 일반 오류 - WinError 5 체크 후 재시도 =====
+        error_str = str(e)
+        is_win_error_5 = "WinError 5" in error_str or "액세스가 거부" in error_str
+
+        if is_win_error_5 and retry_count < max_retries:
+            log_message(f"⚠️ OCR 오류 발생 ({retry_count + 1}/{max_retries + 1}): {error_str}")
+            log_message(f"1초 후 재시도합니다...")
+            time.sleep(1)
+            return read_text_from_region(region_box, retry_count + 1, max_retries)
+        elif retry_count < max_retries:
+            log_message(f"⚠️ OCR 일반 오류 ({retry_count + 1}/{max_retries + 1}): {error_str}")
             log_message(f"0.5초 후 재시도합니다...")
             time.sleep(0.5)
             return read_text_from_region(region_box, retry_count + 1, max_retries)
         else:
-            log_message(f"❌ OCR 오류 ({max_retries}회 재시도 실패): {e}")
+            log_message(f"❌ OCR 오류 ({retry_count + 1}회 시도 후 실패): {error_str}")
             log_message("Tesseract-OCR 설치/경로/언어팩을 확인하세요.")
             return ""
-        # ============================================
+        # =========================================================
 
 def get_target_info(location):
     """체크박스 좌표(중앙) 기준으로 이름 영역 좌표와 텍스트를 반환"""
