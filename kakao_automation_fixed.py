@@ -23,6 +23,8 @@ import os
 from queue import Queue
 from difflib import SequenceMatcher
 import re
+import tempfile
+import ctypes
 
 # --- 선택 의존성(OpenCV) ---
 try:
@@ -110,6 +112,13 @@ def log_message(message):
 # ----------------------------------------
 # 🔒 제어/안전 유틸
 # ----------------------------------------
+def is_admin():
+    """Windows에서 관리자 권한으로 실행 중인지 확인"""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
 def check_stop_signal():
     """'즉시 중지' 버튼이 눌렸는지 확인"""
     if stop_event.is_set():
@@ -219,12 +228,22 @@ def _normalize_name(s):
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
-def read_text_from_region(region_box):
-    """주어진 좌표 영역(x, y, w, h)을 스크린샷 찍어 텍스트로 반환"""
+def read_text_from_region(region_box, retry_count=0, max_retries=3):
+    """
+    주어진 좌표 영역(x, y, w, h)을 스크린샷 찍어 텍스트로 반환
+    Windows 권한 오류 시 자동 재시도 (최대 3회)
+    """
     try:
         check_stop_signal()
         pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD_PATH
+
+        # ===== [수정] 임시 폴더를 명시적으로 지정하여 권한 오류 방지 =====
+        temp_dir = tempfile.gettempdir()
+        os.environ['TESSDATA_PREFIX'] = os.path.dirname(TESSERACT_CMD_PATH)
+        # ===========================================================
+
         screenshot = pyautogui.screenshot(region=region_box)
+
         if _HAS_CV:
             img = np.array(screenshot)
             if img.ndim == 3:
@@ -235,14 +254,40 @@ def read_text_from_region(region_box):
             text = pytesseract.image_to_string(img, lang='kor+eng', config=cfg)
         else:
             text = pytesseract.image_to_string(screenshot, lang='kor+eng')
+
         text = _normalize_name(text)
         if not text:
             log_message("경고: OCR이 텍스트를 인식하지 못했습니다. (빈 문자열)")
         return text
+
+    except PermissionError as e:
+        # ===== [신규] Windows 권한 오류 특별 처리 =====
+        if retry_count < max_retries:
+            log_message(f"⚠️ Windows 권한 오류 발생 ({retry_count + 1}/{max_retries}): {e}")
+            log_message(f"0.5초 후 재시도합니다...")
+            time.sleep(0.5)
+            return read_text_from_region(region_box, retry_count + 1, max_retries)
+        else:
+            log_message(f"❌ OCR 권한 오류 ({max_retries}회 재시도 실패): {e}")
+            log_message("💡 해결 방법:")
+            log_message("  1. 프로그램을 '관리자 권한'으로 실행하세요")
+            log_message("  2. 바이러스 백신/보안 프로그램이 차단하는지 확인하세요")
+            log_message("  3. Tesseract 설치 폴더 권한을 확인하세요")
+            return ""
+        # ================================================
+
     except Exception as e:
-        log_message(f"OCR 오류 발생: {e}")
-        log_message("Tesseract-OCR 설치/경로/언어팩을 확인하세요.")
-        return ""
+        # ===== [수정] 일반 오류도 재시도 로직 적용 =====
+        if retry_count < max_retries:
+            log_message(f"⚠️ OCR 오류 발생 ({retry_count + 1}/{max_retries}): {e}")
+            log_message(f"0.5초 후 재시도합니다...")
+            time.sleep(0.5)
+            return read_text_from_region(region_box, retry_count + 1, max_retries)
+        else:
+            log_message(f"❌ OCR 오류 ({max_retries}회 재시도 실패): {e}")
+            log_message("Tesseract-OCR 설치/경로/언어팩을 확인하세요.")
+            return ""
+        # ============================================
 
 def get_target_info(location):
     """체크박스 좌표(중앙) 기준으로 이름 영역 좌표와 텍스트를 반환"""
@@ -421,7 +466,11 @@ def step_3_execute_loop_mode(message, file_path):
     consecutive_errors = 0
     MAX_CONSECUTIVE_ERRORS = 3  # 3회 연속 예외 발생 시 종료
 
-    # 4. 메인 루프 (스크롤 반복)
+    # 4. (신규) OCR 실패 횟수 추적
+    ocr_fail_count = 0
+    ocr_success_count = 0
+
+    # 5. 메인 루프 (스크롤 반복)
     while True:
         check_stop_signal()
         log_message("\n--- 새 화면 스캔 시작 ---")
@@ -482,9 +531,25 @@ def step_3_execute_loop_mode(message, file_path):
                 center_coord = pyautogui.center(box)
                 name, region = get_target_info(center_coord)
 
+                # ===== [수정] OCR 성공/실패 카운트 =====
                 if not name:
-                    log_message(f"경고: 좌표 {center_coord}의 이름을 읽지 못했습니다. (OCR 실패)")
+                    ocr_fail_count += 1
+                    log_message(f"경고: 좌표 {center_coord}의 이름을 읽지 못했습니다. (OCR 실패 {ocr_fail_count}회)")
+
+                    # OCR 실패율이 너무 높으면 경고
+                    total_ocr_attempts = ocr_success_count + ocr_fail_count
+                    if total_ocr_attempts >= 10 and (ocr_fail_count / total_ocr_attempts) > 0.5:
+                        log_message("⚠️⚠️⚠️ 경고: OCR 실패율이 50%를 초과했습니다! ⚠️⚠️⚠️")
+                        log_message("💡 문제 해결 방법:")
+                        log_message("  1. 프로그램을 닫고 '관리자 권한'으로 다시 실행하세요")
+                        log_message("  2. 바이러스 백신 프로그램을 일시적으로 비활성화하세요")
+                        log_message("  3. OCR_REGION_OFFSET 설정값을 확인하세요")
+                        log_message("현재 진행 상황: 성공 {}, 실패 {}".format(ocr_success_count, ocr_fail_count))
+
                     continue
+                else:
+                    ocr_success_count += 1
+                # ==========================================
 
                 # 6. 'processed_names'에 없는 새로운 이름인지 확인
                 if name not in processed_names:
@@ -777,6 +842,18 @@ def create_gui():
 
     log_message("GUI 준비 완료. 자동화 설정을 확인하세요.")
     log_message(f"Tesseract 경로: {TESSERACT_CMD_PATH}")
+
+    # ===== [신규] 관리자 권한 확인 =====
+    if not is_admin():
+        log_message("⚠️ 경고: 프로그램이 일반 사용자 권한으로 실행 중입니다.")
+        log_message("💡 OCR 권한 오류([WinError 5])가 발생하면:")
+        log_message("   프로그램을 마우스 오른쪽 버튼 클릭 → '관리자 권한으로 실행'하세요.")
+        log_message("")
+    else:
+        log_message("✅ 관리자 권한으로 실행 중입니다.")
+        log_message("")
+    # ===================================
+
     if not os.path.exists(r"C:\Program Files\Tesseract-OCR\tesseract.exe"):
         log_message("경고! Tesseract 경로가 올바르지 않습니다. TESSERACT_CMD_PATH를 수정하세요.")
         safe_messagebox("error", "Tesseract 오류",
