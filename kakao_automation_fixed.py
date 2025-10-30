@@ -233,33 +233,43 @@ def read_text_from_region(region_box, retry_count=0, max_retries=3):
     주어진 좌표 영역(x, y, w, h)을 스크린샷 찍어 텍스트로 반환
     Windows 권한 오류 시 자동 재시도 (최대 3회)
     """
+    temp_image_path = None
     try:
         check_stop_signal()
         pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD_PATH
 
-        # ===== [수정] Windows 임시 폴더를 사용자 폴더로 변경 =====
-        # WinError 5를 피하기 위해 사용자가 쓰기 권한이 있는 폴더 사용
-        user_temp = os.path.join(os.path.expanduser("~"), "AppData", "Local", "Temp")
-        if not os.path.exists(user_temp):
-            os.makedirs(user_temp, exist_ok=True)
-        os.environ['TEMP'] = user_temp
-        os.environ['TMP'] = user_temp
+        # ===== [수정] 사용자 폴더에 임시 이미지 저장 (WinError 5 완전 해결) =====
+        # 스크립트 실행 폴더에 임시 이미지를 저장하여 권한 문제 회피
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        temp_image_path = os.path.join(script_dir, f"temp_ocr_{time.time()}.png")
+
+        # 환경 변수 설정
+        os.environ['TEMP'] = script_dir
+        os.environ['TMP'] = script_dir
         os.environ['TESSDATA_PREFIX'] = os.path.dirname(TESSERACT_CMD_PATH)
-        # =========================================================
+        # ==================================================================
 
         screenshot = pyautogui.screenshot(region=region_box)
 
+        # ===== [신규] 이미지를 안전한 위치에 명시적으로 저장 =====
+        screenshot.save(temp_image_path)
+        # =====================================================
+
         if _HAS_CV:
-            img = np.array(screenshot)
+            # ===== [수정] 파일에서 이미지 읽기 =====
+            img = cv2.imread(temp_image_path)
             if img.ndim == 3:
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
             img = cv2.medianBlur(img, 3)
-            # ===== [수정] pytesseract config에 임시 폴더 명시 =====
-            cfg = f'--oem 1 --psm 7 -c preserve_interword_spaces=1 -c TMPDIR={user_temp}'
+            # ========================================
+
+            cfg = r'--oem 1 --psm 7 -c preserve_interword_spaces=1'
             text = pytesseract.image_to_string(img, lang='kor+eng', config=cfg)
         else:
-            text = pytesseract.image_to_string(screenshot, lang='kor+eng')
+            # ===== [수정] 파일 경로를 직접 전달 =====
+            text = pytesseract.image_to_string(temp_image_path, lang='kor+eng')
+            # ========================================
 
         text = _normalize_name(text)
         if not text:
@@ -280,6 +290,15 @@ def read_text_from_region(region_box, retry_count=0, max_retries=3):
         if is_permission_error and retry_count < max_retries:
             log_message(f"⚠️ Windows 권한 오류 발생 ({retry_count + 1}/{max_retries + 1}): {e}")
             log_message(f"1초 후 재시도합니다...")
+
+            # ===== [신규] 재시도 전 임시 파일 정리 =====
+            if temp_image_path and os.path.exists(temp_image_path):
+                try:
+                    os.remove(temp_image_path)
+                except Exception:
+                    pass
+            # ===========================================
+
             time.sleep(1)
             return read_text_from_region(region_box, retry_count + 1, max_retries)
         else:
@@ -288,7 +307,7 @@ def read_text_from_region(region_box, retry_count=0, max_retries=3):
                 log_message("💡 해결 방법:")
                 log_message("  1. 프로그램을 '관리자 권한'으로 실행하세요")
                 log_message("  2. 바이러스 백신/보안 프로그램을 일시 중지하세요")
-                log_message("  3. C:\\Users\\[사용자명]\\AppData\\Local\\Temp 폴더 권한을 확인하세요")
+                log_message("  3. 스크립트 폴더의 쓰기 권한을 확인하세요")
             return ""
         # ================================================================
 
@@ -296,6 +315,14 @@ def read_text_from_region(region_box, retry_count=0, max_retries=3):
         # ===== [수정] 일반 오류 - WinError 5 체크 후 재시도 =====
         error_str = str(e)
         is_win_error_5 = "WinError 5" in error_str or "액세스가 거부" in error_str
+
+        # ===== [신규] 재시도 전 임시 파일 정리 =====
+        if temp_image_path and os.path.exists(temp_image_path):
+            try:
+                os.remove(temp_image_path)
+            except Exception:
+                pass
+        # ===========================================
 
         if is_win_error_5 and retry_count < max_retries:
             log_message(f"⚠️ OCR 오류 발생 ({retry_count + 1}/{max_retries + 1}): {error_str}")
@@ -312,6 +339,15 @@ def read_text_from_region(region_box, retry_count=0, max_retries=3):
             log_message("Tesseract-OCR 설치/경로/언어팩을 확인하세요.")
             return ""
         # =========================================================
+
+    finally:
+        # ===== [신규] 임시 파일 정리 =====
+        if temp_image_path and os.path.exists(temp_image_path):
+            try:
+                os.remove(temp_image_path)
+            except Exception:
+                pass  # 삭제 실패는 무시 (다음번에 덮어씌워짐)
+        # ==================================
 
 def get_target_info(location):
     """체크박스 좌표(중앙) 기준으로 이름 영역 좌표와 텍스트를 반환"""
